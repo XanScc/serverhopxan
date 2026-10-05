@@ -38,18 +38,15 @@ local settings = {
     maxPlayers = 0, -- 0 = sin limite
     sort = "Random",
     auto = false,
-    eggMode = "", -- "" = apagado, "rare" = huevos raros (top 4), "big" = huevos grandes (30+), "dim" = dimension
+    eggMode = "", -- "" = apagado, "rare" = huevos raros (top 4), "big" = huevos grandes (40+), "dim" = dimension
     -- Estado de la busqueda de huevos (se guarda para que sobreviva a cada salto)
     knownRare = "starry fox", -- nombres de huevos raros ya vistos ("|" entre nombres); se aprenden de los avisos
     eggTop = "[]",         -- los 3 mejores servidores vistos: [{job, score, size, rare}], de mejor a peor
     eggVisited = "[]",     -- ids de servidores ya revisados (no se repiten), de mas viejo a mas nuevo
-    eggPool = "[]",        -- lista de servidores armada con 300 paginas: [{id, p, m}] (se renueva cada POOL_TTL s)
-    eggPoolTime = 0,       -- cuando se armo esa lista (os.time)
-    eggFresh = false,      -- recien encendido un modo: el servidor donde estas NO cuenta, primero viaja
-    dimSeen = "{}",        -- en cuantos servidores estuvo cada objeto tipo portal ({nombre = veces}), para ignorar los permanentes
-    dimVisits = 0,         -- servidores revisados para eso
     eggSamples = 0,        -- servidores revisados en esta busqueda
     eggReturning = false,  -- true mientras viaja de vuelta al mejor servidor
+    lastTeleport = 0,      -- hora del ultimo salto (para no saltar demasiado seguido)
+    huntSkip = "",        -- servidor donde empezo la busqueda: no cuenta nunca
 }
 
 local function saveSettings()
@@ -90,17 +87,25 @@ end
 -- huevo mas grande. Los huevos miden unos cuantos studs, asi que 1000 nunca se alcanza solo con tamano.
 local RARE_BONUS = 1000
 
--- Espacio libre que se exige en un servidor: si se llena, Roblox rechaza la entrada y ya no se puede volver.
--- Al buscar se piden HUNT_MIN_FREE + 1 lugares libres en la lista; al entrar, HUNT_MIN_FREE contandote a ti.
-local HUNT_MIN_FREE = 3
+-- "Casi lleno": un servidor con menos de este numero de lugares libres NO se usa (ni para saltar, ni para
+-- volver): si se llena, Roblox rechaza la entrada y te manda a otro servidor donde ya no esta el huevo.
+local HUNT_MIN_FREE = 2
 
--- Modo "huevos grandes": un huevo de GIANT_MIN studs o mas cuenta como enorme y siempre le gana a uno mas
--- chico; entre enormes (o entre chicos) gana el mas grande.
-local GIANT_MIN = 30.0
-local GIANT_BONUS = 1000
+-- Modo "huevos grandes": solo cuentan los huevos de GIANT_MIN studs o mas; entre ellos gana el mas grande.
+-- Si no hay ninguno no se conforma con uno mas chico: sigue buscando.
+local GIANT_MIN = 40.0
 
 local function resetHunt()
     settings.eggTop, settings.eggSamples, settings.eggReturning = "[]", 0, false
+end
+
+-- Si el menu se carga a mano (no despues de un salto), el servidor donde estas NO cuenta para la busqueda:
+-- se busca en OTROS. Despues de un salto, el servidor nuevo si se revisa.
+local arrivedByHop = env.__SH_TP == true
+env.__SH_TP = nil
+local skipCurrent = not arrivedByHop
+if not arrivedByHop then
+    resetHunt()
 end
 
 -- Los 3 mejores servidores vistos, de mejor a peor. Si el primero ya no deja entrar (lleno), se prueba el
@@ -121,7 +126,7 @@ local function addCandidate(job, score, size, rare, flags)
         end
     end
     table.insert(list, { job = job, score = score, size = size, rare = rare,
-        dim = flags and flags.dim or false, giant = flags and flags.giant or false })
+        giant = flags and flags.giant or false, ann = flags and flags.ann or false, t = os.time() })
     table.sort(list, function(a, b) return a.score > b.score end)
     while #list > 3 do
         table.remove(list)
@@ -136,6 +141,17 @@ local function findCandidate(job)
         end
     end
     return nil
+end
+
+local function removeCandidate(job)
+    local list = topList()
+    for i, candidate in ipairs(list) do
+        if candidate.job == job then
+            table.remove(list, i)
+            break
+        end
+    end
+    settings.eggTop = HttpService:JSONEncode(list)
 end
 
 -- Servidores ya revisados en busquedas anteriores: no se vuelven a visitar. Asi la busqueda avanza por
@@ -173,30 +189,25 @@ local function clearVisited()
     huntVisited = {}
 end
 
-local MAX_PAGES = 250           -- tope de paginas por lista (100 servidores cada una = hasta 25000 servidores)
-local PAGE_DELAY = 0.05        -- pausa minima entre paginas
-local SEARCH_TIMEOUT = 25        -- segundos maximos buscando servidores (salto normal)
-local HUNT_PAGES_PER_LIST = 150 -- paginas por lista al armar los candidatos (2 listas = 300 paginas, mas de 200)
-local HUNT_BUILD_TIMEOUT = 300  -- segundos maximos armando esa lista
-local POOL_MAX = 400            -- servidores que se guardan de esa lista (al azar, de TODAS las paginas)
-local POOL_TTL = 600            -- segundos que vale la lista antes de armarla de nuevo (los servidores cambian)
-local POOL_MIN = 8              -- si quedan menos servidores sin visitar que esto, arma la lista de nuevo
-local HUNT_PICKS = 12           -- a cuantos servidores de la lista intenta entrar en cada salto
-local DIM_WARMUP = 5            -- servidores que revisa antes de fiarse de la deteccion de la dimension
-local DIM_PERMANENT = 0.8       -- un objeto que esta en esta fraccion de los servidores se considera permanente
-local MAX_FAILS_IN_A_ROW = 10 -- paginas seguidas fallidas antes de abandonar esa busqueda
+local MAX_PAGES = 100           -- tope de paginas por lista (100 servidores cada una)
+local HUNT_MAX_PAGES = 50       -- buscando huevos: paginas por extremo de la lista (2 extremos = 100 en total)
+local REQUEST_GAP = 0.3         -- segundos minimos entre peticiones a Roblox (para no ser limitado)
+local SEARCH_TIMEOUT = 15       -- segundos maximos buscando servidores (salto normal)
+local HUNT_SEARCH_TIMEOUT = 15  -- segundos maximos buscando servidores cuando se buscan huevos
+local HUNT_POOL = 30            -- servidores NUEVOS que junta antes de elegir uno al buscar huevos
+local MAX_FAILS_IN_A_ROW = 3    -- peticiones seguidas fallidas antes de abandonar esa busqueda
 local RANDOM_POOL = 30          -- en modo aleatorio junta hasta tantos servidores validos antes de elegir
 local EMPTY_POOL = 15           -- servidores casi vacios que junta el boton "Server privado"
 local EMPTY_MAX_PLAYERS = 1     -- "Server privado" busca servidores con 0 o 1 jugador
 local MAX_TELEPORT_TRIES = 6    -- cuantos servidores distintos prueba si uno esta lleno o cerrado
+local MIN_HOP_GAP = 6           -- segundos minimos entre un salto y el siguiente (si no, Roblox da "Flooded")
+local FLOOD_COOLDOWN = 10       -- espera cuando Roblox dice que se salta muy rapido
 local AUTO_START_DELAY = 2      -- segundos tras entrar a un servidor antes de volver a saltar (modo auto)
-local AUTO_RETRY_DELAY = 3      -- espera tras un intento fallido en modo auto
-local EGG_SCAN_SECONDS = 3     -- segundos que escanea los huevos de cada servidor (cargan poco a poco)
-local EGG_SAMPLE_SERVERS = 8   -- servidores que revisa antes de volver al que tenia el huevo mas grande
-local REQUEST_GAP_MIN = 0.2    -- segundos minimos entre peticiones a la lista de servidores (todas las listas juntas)
-local RATE_GIVEUP = 45          -- segundos seguidos con el limite de Roblox antes de dejar de insistir y avisar
-local FLOOD_COOLDOWN = 10      -- espera si Roblox avisa que se esta saltando demasiado rapido
-local CROWD_CHECK_PAGES = 5    -- paginas de servidores (las mas llenas) que revisa antes de volver a uno guardado
+local AUTO_RETRY_DELAY = 1      -- espera tras iniciar un salto
+local FAIL_RETRY_DELAY = 6      -- espera tras un intento fallido (Roblox limita / sin red)
+local EGG_SCAN_SECONDS = 2.5    -- segundos que escanea los huevos de cada servidor (cargan poco a poco)
+local EGG_SAMPLE_SERVERS = 5    -- servidores que revisa antes de volver al que tenia el mejor huevo
+local RARE_LIFETIME = 270       -- segundos que se da por buena una rareza avisada por el juego
 
 -- Se reemplaza mas abajo, cuando existe el menu, para avisar "Reintentando..."
 local notifyRetry = function() end
@@ -204,102 +215,86 @@ local notifyRetry = function() end
 ---------------------------------------------------------------------
 -- Busqueda de servidores
 ---------------------------------------------------------------------
--- Una peticion GET. Devuelve (cuerpo, codigo de estado, segundos de espera que pide Roblox).
--- Usa la funcion request del ejecutor (da el codigo de estado, asi se distingue el limite de peticiones
--- 429 de un error de red) y, si no existe, game:HttpGet.
-local function httpRequest(url)
-    local req = request or http_request or (syn and syn.request) or (http and http.request)
-    if req then
-        local ok, res = pcall(req, { Url = url, Method = "GET" })
-        if ok and type(res) == "table" and res.StatusCode then
-            local retryAfter
-            if type(res.Headers) == "table" then
-                retryAfter = tonumber(res.Headers["retry-after"] or res.Headers["Retry-After"])
-            end
-            return res.Body, res.StatusCode, retryAfter
-        end
-    end
-
-    local ok, result = pcall(function()
+-- game:HttpGet en Xeno/Delta; si no existe, usa la funcion request del ejecutor.
+-- Devuelve el texto, o (nil, codigo, espera) si fallo (429 = Roblox limito las peticiones).
+local function httpGet(url)
+    local ok, body = pcall(function()
         return game:HttpGet(url)
     end)
-    if ok and result then
-        return result, 200
+    if ok and body then
+        return body
     end
-    if tostring(result):find("429", 1, true) then
+    local message = tostring(body)
+    if message:find("429", 1, true) or message:lower():find("too many", 1, true) then
         return nil, 429
+    end
+
+    local req = request or http_request or (syn and syn.request) or (http and http.request)
+    if req then
+        local ok2, res = pcall(req, { Url = url, Method = "GET" })
+        if ok2 and res then
+            if res.StatusCode == 200 and res.Body then
+                return res.Body
+            end
+            local headers = res.Headers or {}
+            return nil, tonumber(res.StatusCode) or 0, tonumber(headers["retry-after"] or headers["Retry-After"])
+        end
     end
     return nil, 0
 end
 
--- Ritmo de peticiones: todas las listas comparten el mismo turno, para no saturar a Roblox (si se pide
--- demasiado rapido responde 429). Si aun asi limita, el ritmo se hace mas lento y despues se recupera.
-local requestGap = REQUEST_GAP_MIN
+-- Pide UNA pagina de servidores (un solo intento), sin pasar de una peticion cada REQUEST_GAP segundos.
+-- Devuelve la pagina, o (nil, codigo, espera) si fallo.
 local lastRequest = 0
-local rateLimitUntil = 0
-
--- Pide UNA pagina de servidores. Devuelve la pagina, o (nil, "rate") si Roblox limito las peticiones,
--- o (nil, "net") si hubo un error de red / de Roblox.
 local function fetchPage(sortOrder, cursor)
     local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100&excludeFullGames=true"):format(placeId, sortOrder)
     if cursor then
         url = url .. "&cursor=" .. cursor
     end
 
-    -- espera su turno (se reserva antes de esperar, asi la otra lista toma el turno siguiente)
-    local now = os.clock()
-    local at = math.max(lastRequest + requestGap, rateLimitUntil, now)
+    local at = math.max(os.clock(), lastRequest + REQUEST_GAP)
     lastRequest = at
-    if at > now then
-        task.wait(at - now)
+    if at > os.clock() then
+        task.wait(at - os.clock())
     end
 
-    local body, status, retryAfter = httpRequest(url)
-    if status == 429 then
-        requestGap = math.min(requestGap * 2, 4)
-        rateLimitUntil = os.clock() + (retryAfter or 3)
-        return nil, "rate"
+    local ok, body, code, retry = pcall(httpGet, url)
+    if not ok or not body then
+        return nil, (ok and code) or 0, retry
     end
-    if status ~= 200 or not body then
-        return nil, "net"
-    end
-
-    local ok, decoded = pcall(function()
+    local ok2, decoded = pcall(function()
         return HttpService:JSONDecode(body)
     end)
-    if ok and type(decoded) == "table" and type(decoded.data) == "table" then
-        requestGap = math.max(REQUEST_GAP_MIN, requestGap * 0.7)
+    if ok2 and type(decoded) == "table" and type(decoded.data) == "table" then
         return decoded
     end
-    return nil, "net"
+    return nil, 0
 end
 
--- Recorre paginas juntando servidores que cumplan `accept`. No se rinde: sigue pasando de pagina
--- hasta juntar suficientes, llegar al final de la lista o agotar el tiempo.
+-- Recorre paginas juntando servidores que cumplan `accept`; se detiene en cuanto junta suficientes, llega al
+-- final de la lista, o se acaba el tiempo / las paginas.
 --   orders:   lista de ordenes a recorrer AL MISMO TIEMPO (ej. {"Asc","Desc"} = empieza por los dos extremos)
 --   target:   deja de buscar al juntar tantos servidores validos
 --   firstHit: si es true, se detiene en la primera pagina que tenga resultados
 --             (la lista viene ordenada, asi que lo mejor esta al principio)
--- Si Roblox limita las peticiones espera y sigue (no cuenta como fallo); solo se rinde ante errores de red.
--- Devuelve (lista, fallo, limitado): `fallo` es true si no junto nada por culpa de errores / del limite,
--- y `limitado` si Roblox llego a limitar las peticiones.
+-- Si Roblox limita una pagina, espera lo que pide y reintenta unas pocas veces; si sigue limitando, se rinde.
+-- Devuelve (lista, huboError): huboError solo si no se junto ningun servidor.
 local function collectServers(accept, orders, target, firstHit, onProgress, timeout, maxPages)
     local found, seen = {}, {}
     local deadline = os.clock() + (timeout or SEARCH_TIMEOUT)
+    local limit = maxPages or MAX_PAGES
     local finished, pagesDone = 0, 0
-    local stop, hadError, hadRate = false, false, false
+    local stop, hadError = false, false
 
     local function chain(sortOrder)
         local cursor
         local pages, fails = 0, 0
-        local lastGood = os.clock()
-        while pages < (maxPages or MAX_PAGES) and not stop and os.clock() < deadline do
-            local page, reason = fetchPage(sortOrder, cursor)
+        while pages < limit and not stop and os.clock() < deadline do
+            local page, code, retryAfter = fetchPage(sortOrder, cursor)
             if stop then break end
 
             if page then
                 fails = 0
-                lastGood = os.clock()
                 pages = pages + 1
                 pagesDone = pagesDone + 1
                 if onProgress then onProgress(pagesDone) end
@@ -307,8 +302,7 @@ local function collectServers(accept, orders, target, firstHit, onProgress, time
                 for _, server in ipairs(page.data) do
                     if not seen[server.id] and accept(server) then
                         seen[server.id] = true
-                        -- solo lo necesario (miles de servidores ocuparian mucha memoria)
-                        table.insert(found, { id = server.id, playing = server.playing, maxPlayers = server.maxPlayers })
+                        table.insert(found, server)
                     end
                 end
 
@@ -319,18 +313,12 @@ local function collectServers(accept, orders, target, firstHit, onProgress, time
 
                 cursor = page.nextPageCursor
                 if not cursor then break end -- ya no hay mas paginas
-                task.wait(PAGE_DELAY)
-            elseif reason == "rate" then
-                -- fetchPage ya fijo la espera; la proxima peticion (de cualquier lista) la respeta
-                hadRate = true
-                if os.clock() - lastGood > RATE_GIVEUP then break end
-                notifyRetry("rate")
             else
                 fails = fails + 1
                 hadError = true
                 if fails >= MAX_FAILS_IN_A_ROW then break end
-                notifyRetry("net")
-                task.wait(math.min(0.4 * fails, 2))
+                notifyRetry(fails)
+                task.wait(code == 429 and math.min(retryAfter or (2 * fails), 6) or math.min(0.4 * fails, 2))
             end
         end
         finished = finished + 1
@@ -344,34 +332,7 @@ local function collectServers(accept, orders, target, firstHit, onProgress, time
     end
     stop = true
 
-    return found, (hadError or hadRate) and #found == 0, hadRate
-end
-
--- Antes de volver a un servidor guardado: mira los servidores mas llenos de la lista (salen primero en el
--- orden "Desc") y descarta los candidatos que ya estan casi llenos. Asi no se intenta entrar a uno que
--- Roblox va a rechazar y que mandaria a otro servidor sin huevo.
-local function stillRoomy(list)
-    local crowded = {}
-    local cursor
-    for _ = 1, CROWD_CHECK_PAGES do
-        local page = fetchPage("Desc", cursor)
-        if not page then break end
-        for _, server in ipairs(page.data) do
-            if server.playing and server.maxPlayers and server.maxPlayers - server.playing < HUNT_MIN_FREE + 1 then
-                crowded[server.id] = true
-            end
-        end
-        cursor = page.nextPageCursor
-        if not cursor then break end
-    end
-
-    local reachable = {}
-    for _, candidate in ipairs(list) do
-        if not crowded[candidate.job] then
-            table.insert(reachable, candidate)
-        end
-    end
-    return reachable
+    return found, hadError and #found == 0
 end
 
 local function baseAccept(server)
@@ -379,14 +340,14 @@ local function baseAccept(server)
         and server.playing ~= nil
         and server.maxPlayers ~= nil
         and server.playing < server.maxPlayers
+        -- casi lleno: no se usa nunca (se llenaria antes de entrar y Roblox te mandaria a otro servidor)
+        and server.maxPlayers - server.playing >= HUNT_MIN_FREE
 end
 
 local function normalAccept(server)
     if not baseAccept(server) then return false end
-    -- Buscando huevos: solo servidores con espacio de sobra (al entrar tu y mientras vuelves se llenan)
-    if huntOn() and server.maxPlayers - server.playing < HUNT_MIN_FREE + 1 then return false end
     -- Buscando huevos: no repite servidores que ya reviso
-    if huntOn() and huntVisited[server.id] then return false end
+    if huntOn() and (huntVisited[server.id] or server.id == settings.huntSkip) then return false end
     if server.playing < settings.minPlayers then return false end
     if settings.maxPlayers > 0 and server.playing > settings.maxPlayers then return false end
     return true
@@ -719,7 +680,7 @@ end
 local rareRow = modeRow("Huevos raros (top 4)", -60)
 local rareTrack, refreshRare = makeSwitch(rareRow, function() return settings.eggMode == "rare" end)
 
-local bigRow = modeRow("Huevos grandes (30+)", -134)
+local bigRow = modeRow("Huevos grandes (40+)", -134)
 local bigTrack, refreshBig = makeSwitch(bigRow, function() return settings.eggMode == "big" end)
 
 local dimRow = modeRow("Dimensión (Dr. Scramble)", -60)
@@ -806,19 +767,15 @@ local function setStatus(text, kind)
 end
 setStatus("Listo", "ok")
 
-notifyRetry = function(kind)
-    if kind == "rate" then
-        setStatus("Roblox limitó las peticiones; espero y sigo...", "busy")
-    else
-        setStatus("Roblox va lento, sigo buscando...", "busy")
-    end
+notifyRetry = function()
+    setStatus("Roblox va lento, sigo buscando...", "busy")
 end
 
 -- Credito abajo, tambien en arcoiris
 local footer = make("TextLabel", {
     Size = UDim2.new(1, 0, 1, 0),
     BackgroundTransparency = 1,
-    Text = "by @XanScc | v16",
+    Text = "by @XanScc | v14.1",
     TextColor3 = C.white,
     Font = Enum.Font.GothamBold,
     TextSize = 12,
@@ -901,8 +858,42 @@ local pool = {}          -- servidores candidatos del salto actual, en orden de 
 local poolIndex = 1      -- siguiente candidato a probar
 local triesUsed = 0      -- cuantos candidatos se han intentado en este salto
 local busyToken = 0
-local lastTarget            -- ultimo servidor al que se intento entrar
-local teleportCooldownUntil = 0 -- si Roblox dice que se salta muy rapido, no se salta antes de esta hora
+
+-- Hace que el menu se cargue de nuevo en el servidor nuevo (y le avisa que llego por un salto)
+local function queueReload()
+    if not queued and queue_on_teleport and SRC then
+        queued = true
+        pcall(queue_on_teleport, string.format(
+            "local e=(getgenv and getgenv()) or _G; e.__SH_TP=true; e.__SH_SRC=%q; loadstring(e.__SH_SRC)()", SRC))
+    end
+end
+
+-- Si Roblox no responde en 20s, libera el boton para volver a intentar
+local function armBusyRelease()
+    busyToken = busyToken + 1
+    local token = busyToken
+    task.delay(20, function()
+        if busyToken == token then
+            busy = false
+        end
+    end)
+end
+
+-- Anota la hora del salto y espera lo que falte para no saltar demasiado seguido
+-- (si no, Roblox rechaza con "Flooded"). Si la hora del sistema es rara, no espera.
+local function waitTeleportCooldown()
+    local since = os.time() - settings.lastTeleport
+    if since < 0 or since >= MIN_HOP_GAP then return end
+    local deadline = os.clock() + (MIN_HOP_GAP - since)
+    while alive() and os.clock() < deadline do
+        task.wait(0.25)
+    end
+end
+
+local function markTeleport()
+    settings.lastTeleport = os.time()
+    saveSettings()
+end
 
 -- Intenta entrar al siguiente candidato de la lista. Devuelve true si el teleport arranco.
 local function teleportNext()
@@ -910,18 +901,8 @@ local function teleportNext()
         local target = pool[poolIndex]
         poolIndex = poolIndex + 1
         triesUsed = triesUsed + 1
-        lastTarget = target
-        if huntOn() then
-            markVisited(target.id)
-            saveSettings()
-        end
 
-        -- Hace que el menu se cargue de nuevo en el servidor nuevo
-        if not queued and queue_on_teleport and SRC then
-            queued = true
-            pcall(queue_on_teleport, string.format(
-                "local e=(getgenv and getgenv()) or _G; e.__SH_SRC=%q; loadstring(e.__SH_SRC)()", SRC))
-        end
+        queueReload()
 
         if target.label then
             setStatus(target.label, "info")
@@ -930,205 +911,120 @@ local function teleportNext()
         else
             setStatus(("Teletransportando... (%d/%d jugadores)"):format(target.playing, target.maxPlayers), "info")
         end
+        markTeleport()
         local ok = pcall(function()
             TeleportService:TeleportToPlaceInstance(placeId, target.id, player)
         end)
         if ok then
-            -- Si Roblox no responde en 20s, libera el boton para volver a intentar
-            busyToken = busyToken + 1
-            local token = busyToken
-            task.delay(20, function()
-                if busyToken == token then
-                    busy = false
-                end
-            end)
+            armBusyRelease()
             return true
         end
     end
     return false
 end
 
-local function resultIs(result, name)
-    local ok, value = pcall(function()
-        return Enum.TeleportResult[name]
+-- Plan B: si Roblox no da la lista de servidores (limite o sin red), Roblox elige uno por nosotros.
+-- Asi el salto siempre cambia de servidor, sin quedarse pegado reintentando.
+local function plainTeleport()
+    setStatus("Teletransportando...", "info")
+    queueReload()
+    markTeleport()
+    local ok = pcall(function()
+        TeleportService:Teleport(placeId, player)
     end)
-    return ok and result == value
-end
-
--- Si hubo que esperar por saltar demasiado rapido, espera aqui antes del siguiente salto
-local function waitTeleportCooldown()
-    while alive() and os.clock() < teleportCooldownUntil do
-        setStatus(("Espero %ds para no saltar demasiado rápido..."):format(math.ceil(teleportCooldownUntil - os.clock())), "busy")
-        task.wait(0.5)
+    if ok then
+        armBusyRelease()
     end
+    return ok
 end
 
 -- Si el servidor elegido se lleno o cerro, prueba automaticamente con el siguiente
 TeleportService.TeleportInitFailed:Connect(function(_, result, message)
     if not alive() or not busy then return end
-
-    -- un servidor lleno o cerrado no se vuelve a intentar pronto
-    if lastTarget and lastTarget.id then
-        markVisited(lastTarget.id)
-        saveSettings()
-    end
-
-    if resultIs(result, "Flooded") then
-        -- esto si lo provoca el script (saltos muy seguidos): espera y sigue
-        teleportCooldownUntil = os.clock() + FLOOD_COOLDOWN
-        setStatus("Muchos saltos seguidos; espero unos segundos...", "busy")
+    if result == Enum.TeleportResult.Flooded then
+        -- Roblox pide ir mas despacio: no es un servidor malo, es que se salto muy rapido
+        setStatus("Roblox pide ir más despacio, espero...", "busy")
         task.wait(FLOOD_COOLDOWN)
-    elseif resultIs(result, "GameFull") then
-        setStatus("Servidor lleno, probando otro...", "busy")
-    elseif resultIs(result, "GameEnded") or resultIs(result, "GameNotFound") then
-        setStatus("Servidor cerrado, probando otro...", "busy")
+        if not alive() or not busy then return end
     else
-        setStatus("No pude entrar, probando otro...", "busy")
+        setStatus("Servidor no disponible, probando otro...", "busy")
     end
-
     if not teleportNext() then
-        setStatus("Ningún servidor aceptó, reintento...", "busy")
+        setStatus("Ningún servidor aceptó, reintenta", "error")
         busy = false
     end
 end)
-
--- Lista de servidores para buscar huevos / dimension. Se arma recorriendo 300 paginas (150 por cada extremo
--- de la lista) y se guardan 400 servidores elegidos al azar de TODAS ellas; asi se busca en mas de 200 paginas
--- y no siempre en los mismos. Dura 10 minutos; despues se arma de nuevo.
-local function loadPool()
-    local ok, list = pcall(function()
-        return HttpService:JSONDecode(settings.eggPool)
-    end)
-    return (ok and type(list) == "table") and list or {}
-end
-
--- Servidores de la lista guardada que aun no se han visitado
-local function freshFromPool(visited)
-    local out = {}
-    for _, entry in ipairs(loadPool()) do
-        if entry.id ~= currentJobId and not visited[entry.id] then
-            table.insert(out, { id = entry.id, playing = entry.p, maxPlayers = entry.m })
-        end
-    end
-    return out
-end
-
--- Recorre las 300 paginas. Devuelve (servidores, fallo, limitado)
-local function buildPool(visited)
-    huntVisited = visited
-    local found, failed, rateLimited = collectServers(normalAccept, { "Asc", "Desc" }, math.huge, false, function(page)
-        setStatus(("Armando la lista de servidores... (página %d/%d)"):format(page, HUNT_PAGES_PER_LIST * 2), "busy")
-    end, HUNT_BUILD_TIMEOUT, HUNT_PAGES_PER_LIST)
-
-    shuffle(found)
-    local keep, compact = {}, {}
-    for i = 1, math.min(#found, POOL_MAX) do
-        keep[i] = found[i]
-        compact[i] = { id = found[i].id, p = found[i].playing, m = found[i].maxPlayers }
-    end
-    if #keep > 0 then
-        settings.eggPool = HttpService:JSONEncode(compact)
-        settings.eggPoolTime = os.time()
-        saveSettings()
-    end
-    return keep, failed, rateLimited
-end
-
--- Servidores a los que saltar. Devuelve (lista, fallo, limitado, sinNuevos). `sinNuevos` es true si ni
--- siquiera con 300 paginas nuevas hay un solo servidor valido: "ni modo", la busqueda se detiene.
-local function huntCandidates()
-    local visited = loadVisited()
-    huntVisited = visited
-
-    local fresh = {}
-    if os.time() - (settings.eggPoolTime or 0) < POOL_TTL then
-        fresh = freshFromPool(visited)
-    end
-
-    local failed, rateLimited = false, false
-    if #fresh < POOL_MIN then
-        fresh, failed, rateLimited = buildPool(visited)
-        if #fresh == 0 and not failed and next(visited) ~= nil then
-            -- ya visito todo lo que habia: olvida lo visitado y arma la lista una vez mas
-            clearVisited()
-            saveSettings()
-            setStatus("Ya revisé todos; armo la lista de nuevo...", "busy")
-            fresh, failed, rateLimited = buildPool({})
-        end
-        if #fresh == 0 and not failed then
-            return {}, false, false, true
-        end
-    end
-
-    shuffle(fresh)
-    local picks = {}
-    for i = 1, math.min(#fresh, HUNT_PICKS) do
-        picks[i] = fresh[i]
-    end
-    return picks, failed and #picks == 0, rateLimited, false
-end
 
 -- mode: nil = salto normal (con filtros del menu), "empty" = servidor casi vacio
 local function hop(mode)
     if busy then return false end
     busy = true
-    waitTeleportCooldown()
 
-    local ok, list, failed, rateLimited
+    waitTeleportCooldown()
+    if not alive() then
+        busy = false
+        return false
+    end
+
+    local hunting = huntOn() and mode ~= "empty"
+    local ok, list, failed
     if mode == "empty" then
         setStatus("Buscando server vacío...", "busy")
-        ok, list, failed, rateLimited = pcall(collectServers, emptyAccept, { "Asc" }, EMPTY_POOL, true, function(page)
-            setStatus(("Buscando server vacío... (página %d)"):format(page), "busy")
-        end)
+        ok, list, failed = pcall(collectServers, emptyAccept, { "Asc" }, EMPTY_POOL, true, nil, nil, MAX_PAGES)
     else
-        if huntOn() then
-            -- Buscando huevos / dimension: elige entre la lista grande armada con 300 paginas
-            local noNew
-            ok, list, failed, rateLimited, noNew = pcall(huntCandidates)
-            if ok and noNew then
-                -- ni modo: no hay servidores validos ni en 300 paginas nuevas
-                settings.eggMode = ""
-                settings.eggFresh = false
-                resetHunt()
-                refreshRare(true)
-                refreshBig(true)
-                refreshDim(true)
-                saveSettings()
-                statusSuffix = ""
-                setStatus("No encontré servidores nuevos en 300 páginas; búsqueda detenida", "error")
-                busy = false
-                return false
+        -- Buscando huevos siempre recorre los dos extremos de la lista a la vez y elige al azar entre
+        -- servidores nuevos, sin importar el orden elegido.
+        local isRandom = hunting or settings.sort == "Random"
+        local orders = isRandom and { "Asc", "Desc" } or { (settings.sort == "Most") and "Desc" or "Asc" }
+        local target = hunting and HUNT_POOL or (isRandom and RANDOM_POOL or 15)
+        local timeout = hunting and HUNT_SEARCH_TIMEOUT or nil
+        local maxPages = hunting and HUNT_MAX_PAGES or MAX_PAGES
+
+        local function search()
+            if not hunting then
+                setStatus("Buscando servidores...", "busy")
+            else
+                huntVisited = loadVisited()
             end
-        else
-            local isRandom = settings.sort == "Random"
-            local orders = isRandom and { "Asc", "Desc" } or { (settings.sort == "Most") and "Desc" or "Asc" }
-            setStatus("Buscando servidores...", "busy")
-            ok, list, failed, rateLimited = pcall(collectServers, normalAccept, orders,
-                isRandom and RANDOM_POOL or 15, not isRandom, function(page)
-                    if page > 1 then
-                        setStatus(("Buscando servidores... (página %d)"):format(page), "busy")
-                    end
-                end)
+            return pcall(collectServers, normalAccept, orders, target, not isRandom, nil, timeout, maxPages)
+        end
+
+        ok, list, failed = search()
+
+        -- Si ya reviso todos los servidores que hay, olvida la lista y busca una vez mas
+        if hunting and ok and #list == 0 and not failed and next(huntVisited) ~= nil then
+            clearVisited()
+            saveSettings()
+            ok, list, failed = search()
         end
     end
 
     if not ok then
-        -- error del propio script: se avisa y el detalle va a la consola
-        warn("[@XanScc Server] error al buscar servidores: " .. tostring(list))
         setStatus("Error al buscar servidores", "error")
         busy = false
         return false
     end
     if #list == 0 then
-        if failed and rateLimited then
-            -- Roblox limito las peticiones: es temporal, el script espera solo y reintenta
-            setStatus("Roblox limitó las peticiones; espero y reintento", "busy")
-        elseif failed then
-            setStatus("Sin respuesta de Roblox (red o servidor), reintento", "error")
+        if failed then
+            -- Roblox no dio la lista (limite o sin red): no es del script, pero no se queda parado
+            if mode ~= "empty" and (hunting or (settings.minPlayers <= 1 and settings.maxPlayers == 0)) then
+                if plainTeleport() then
+                    return true
+                end
+            end
+            setStatus("Error de red o límite de Roblox, reintenta", "error")
+        elseif hunting then
+            -- ni modo: no hay servidores con espacio; no se queda buscando para siempre
+            settings.eggMode = ""
+            resetHunt()
+            statusSuffix = ""
+            refreshRare(true)
+            refreshBig(true)
+            refreshDim(true)
+            saveSettings()
+            setStatus("No encontré servidores con espacio; búsqueda detenida", "error")
         elseif mode == "empty" then
             setStatus("No hay servers con 0-1 jugadores ahora", "error")
-        elseif huntOn() then
-            setStatus("No hay servidores con espacio ahora; reintento", "busy")
         else
             setStatus("No hay servidores con ese filtro", "error")
         end
@@ -1140,7 +1036,7 @@ local function hop(mode)
     if mode == "empty" then
         shuffle(list)
         table.sort(list, function(a, b) return a.playing < b.playing end) -- los mas vacios primero
-    elseif settings.sort == "Random" or huntOn() then
+    elseif settings.sort == "Random" or hunting then
         shuffle(list)
     end
 
@@ -1159,10 +1055,11 @@ end
 local function goToServer(candidates, label)
     if busy then return false end
     busy = true
-    waitTeleportCooldown()
     pool = {}
     for _, candidate in ipairs(candidates) do
-        table.insert(pool, { id = candidate.job, label = label })
+        if candidate.job ~= game.JobId then
+            table.insert(pool, { id = candidate.job, label = label })
+        end
     end
     poolIndex = 1
     triesUsed = 0
@@ -1213,20 +1110,20 @@ end)
 -- Enciende un modo de busqueda de huevos (y apaga los otros). Pulsar el activo lo apaga.
 local function setEggMode(mode)
     settings.eggMode = (settings.eggMode == mode) and "" or mode
-    -- Cada vez que cambia el modo empieza una busqueda nueva
+    -- Cada vez que cambia el modo empieza una busqueda nueva, y el servidor donde estas no cuenta
     resetHunt()
-    settings.eggFresh = settings.eggMode ~= "" -- recien encendido: primero viaja a otros servidores
+    skipCurrent = true
     statusSuffix = ""
     refreshRare(true)
     refreshBig(true)
     refreshDim(true)
     saveSettings()
     if settings.eggMode == "rare" then
-        setStatus("Raros primero (Divine, Eternal, Secret, Cosmic); si no hay, el más grande", "ok")
+        setStatus("Busco solo huevos raros (Divine, Eternal, Secret, Cosmic) en otros servidores", "ok")
     elseif settings.eggMode == "big" then
-        setStatus("Huevos de 30+ primero; si no hay, el más grande", "ok")
+        setStatus("Busco solo huevos de 40.0 o más en otros servidores", "ok")
     elseif settings.eggMode == "dim" then
-        setStatus("Buscando un servidor con la dimensión (Dr. Scramble) abierta", "ok")
+        setStatus("Busco otro servidor con la dimensión (Dr. Scramble) abierta", "ok")
     else
         setStatus("Búsqueda de huevos apagada", "info")
     end
@@ -1417,22 +1314,17 @@ local function findRareEgg()
     return nil
 end
 
--- Una sola pasada por el mapa. Devuelve (huevo mas grande >= GIANT_MIN fuera de la biblioteca de modelos,
--- nombre del primer objeto tipo portal o nil, huevo enorme, todos los objetos tipo portal {clave = nombre}).
--- Los objetos tipo portal se reconocen por el nombre (scramble / rift / dimension / portal) y se descartan
--- maquinas, tiendas y carteles. Pero ese nombre tambien lo llevan objetos que existen SIEMPRE (puertas de
--- zona, carteles...): por eso judgeDimension aprende cuales son permanentes y los ignora.
+-- Una sola pasada por el mapa. Devuelve (huevo mas grande fuera de la biblioteca de modelos,
+-- nombre del objeto de la dimension abierta o nil, huevo enorme). wantGiant / wantDim = false apaga esa parte.
+-- La dimension (el portal del jefe Dr. Scramble, o el Rift) se reconoce por el nombre del portal; se descartan maquinas, tiendas y carteles
+-- que existen siempre en el lobby (la "Rift Machine", la tienda de jefes...).
 local DIM_WORDS = { "scramble", "rift", "dimension", "portal" }
 local DIM_SKIP = { "machine", "shop", "button", "index", "token", "banner", "sign", "egg", "teleportpad", "spawn" }
 
--- "DrScramblePortal_123" -> "drscrambleportal": letras solamente, para comparar entre servidores
-local function normalizeDimName(name)
-    return (name:lower():gsub("[%d%p%s]+", "")):sub(1, 40)
-end
-
-local function scanMap()
+local function scanMap(wantGiant, wantDim)
+    wantGiant = wantGiant ~= false
+    wantDim = wantDim ~= false
     local giant, giantInst, dimension = 0, nil, nil
-    local dimNames = {}
     local character = player.Character
     local assets = workspace:FindFirstChild("ClientRenderedAssets")
 
@@ -1446,14 +1338,14 @@ local function scanMap()
         if inst:IsA("Model") or inst:IsA("BasePart") then
             local name = inst.Name:lower()
 
-            if name:find("egg", 1, true) and not (assets and inst:IsDescendantOf(assets)) then
+            if wantGiant and name:find("egg", 1, true) and not (assets and inst:IsDescendantOf(assets)) then
                 local size = largestDimension(inst)
                 if size > giant then
                     giant, giantInst = size, inst
                 end
             end
 
-            if not (character and inst:IsDescendantOf(character)) then
+            if wantDim and not dimension and not (character and inst:IsDescendantOf(character)) then
                 for _, word in ipairs(DIM_WORDS) do
                     if name:find(word, 1, true) then
                         local skip = false
@@ -1464,11 +1356,10 @@ local function scanMap()
                             end
                         end
                         if not skip then
-                            local key = normalizeDimName(inst.Name)
-                            if key ~= "" and not dimNames[key] then
-                                dimNames[key] = inst.Name:sub(1, 30)
+                            dimension = inst.Name:sub(1, 30)
+                            if not wantGiant then
+                                return giant, dimension, giantInst
                             end
-                            dimension = dimension or inst.Name:sub(1, 30)
                         end
                         break
                     end
@@ -1476,49 +1367,7 @@ local function scanMap()
             end
         end
     end
-    return giant, dimension, giantInst, dimNames
-end
-
-local function loadDimSeen()
-    local ok, seen = pcall(function()
-        return HttpService:JSONDecode(settings.dimSeen)
-    end)
-    return (ok and type(seen) == "table") and seen or {}
-end
-
--- Decide si en este servidor hay una dimension ABIERTA. Un objeto tipo portal que esta en casi todos los
--- servidores (>= DIM_PERMANENT) es permanente (una puerta, un cartel) y no cuenta; solo cuenta uno que
--- aparece de vez en cuando. Los primeros DIM_WARMUP servidores solo sirven para aprender.
--- Devuelve (nombre de la dimension abierta o nil, si ya aprendio lo suficiente).
-local function judgeDimension(dimNames)
-    local seen = loadDimSeen()
-    local visits = settings.dimVisits
-    local learned = visits >= DIM_WARMUP
-
-    local open
-    if learned then
-        for key, raw in pairs(dimNames) do
-            if (seen[key] or 0) / visits < DIM_PERMANENT then
-                open = open or raw
-            end
-        end
-    end
-
-    -- registra este servidor
-    for key in pairs(dimNames) do
-        seen[key] = (seen[key] or 0) + 1
-    end
-    visits = visits + 1
-    if visits > 200 then -- olvida lo viejo poco a poco
-        for key, n in pairs(seen) do
-            seen[key] = math.floor(n / 2)
-        end
-        visits = math.floor(visits / 2)
-    end
-    settings.dimSeen = HttpService:JSONEncode(seen)
-    settings.dimVisits = visits
-
-    return open, learned
+    return giant, dimension, giantInst
 end
 
 local function notify(text)
@@ -1558,7 +1407,8 @@ local function parseAnnouncement(text)
 end
 
 local function checkAnnouncement(text)
-    if type(text) ~= "string" or text == "" then return end
+    -- los avisos son frases largas: ignora rapido los textos cortos o enormes (contadores, dinero, etc.)
+    if type(text) ~= "string" or #text < 20 or #text > 300 then return end
     local lower = text:lower()
     if lower:find("egg", 1, true) and lower:find("spawned", 1, true) then
         local summary, egg = parseAnnouncement(text)
@@ -1576,16 +1426,17 @@ local function checkAnnouncement(text)
     end
 end
 
--- Se queda en este servidor (avisando) hasta que apagues la busqueda de huevos.
+-- Se queda en este servidor (avisando) hasta que apagues la busqueda de huevos o cambies de modo.
 -- En modo "raros", si mientras tanto llega un aviso de huevo raro, lo muestra.
 local function holdHere(message)
     statusSuffix = ""
     setStatus(message, "ok")
     notify(message)
 
+    local held = settings.eggMode
     local seen = announcementTime
-    while alive() and huntOn() do
-        if settings.eggMode == "rare" and announcementRarity and announcementTime > seen then
+    while alive() and settings.eggMode == held do
+        if held == "rare" and announcementRarity and announcementTime > seen then
             seen = announcementTime
             local text = "¡Huevo raro! " .. tostring(announcement)
             setStatus(text, "ok")
@@ -1595,19 +1446,13 @@ local function holdHere(message)
     end
 end
 
--- "Encontrado: huevo Secret (12.3)" (modo raros) / "Encontrado: huevo más grande (12.3)" (grandes)
-local function foundMessage(mode, rareWord, size, giant)
+-- "¡Aquí! Huevo Secret: 12.3" (modo raros) / "¡Aquí! Huevo gigante: 45.0" (modo grandes)
+local function foundMessage(rareWord, size)
     if rareWord then
         local label = rareWord:sub(1, 1):upper() .. rareWord:sub(2)
-        return ("Encontrado: huevo %s (%.1f)"):format(label, size)
+        return ("¡Aquí! Huevo %s: %.1f"):format(label, size)
     end
-    if giant then
-        return ("Encontrado: huevo gigante (%.1f)"):format(size)
-    end
-    if mode == "rare" then
-        return ("Encontrado: huevo más grande (%.1f), sin raros"):format(size)
-    end
-    return ("Encontrado: huevo más grande (%.1f)"):format(size)
+    return ("¡Aquí! Huevo gigante: %.1f"):format(size)
 end
 
 task.spawn(function()
@@ -1870,6 +1715,162 @@ end)
 ---------------------------------------------------------------------
 -- Loop principal: busqueda de huevos y modo automatico
 ---------------------------------------------------------------------
+-- Un salto con pausa: si falla (Roblox limita o no responde) espera un poco mas antes de reintentar
+local function pacedHop()
+    local started = hop()
+    task.wait(started and AUTO_RETRY_DELAY or FAIL_RETRY_DELAY)
+end
+
+local function searchText(mode)
+    return (mode == "rare" and "Buscando huevos raros...")
+        or (mode == "dim" and "Buscando la dimensión...")
+        or "Buscando huevos grandes..."
+end
+
+-- Revisa el servidor donde estoy (solo despues de un salto) y decide: quedarme, volver al mejor, o seguir
+local function huntStep()
+    local mode = settings.eggMode
+    statusSuffix = ""
+    setStatus(searchText(mode), "busy")
+
+    -- El servidor donde estabas al empezar no cuenta: se busca en OTROS
+    if skipCurrent then
+        skipCurrent = false
+        settings.huntSkip = game.JobId
+        markVisited(game.JobId)
+        saveSettings()
+        pacedHop()
+        return
+    end
+
+    -- Escanea unos segundos (el mapa carga poco a poco) y se queda con lo mejor visto
+    local biggest, checked = 0, 0
+    local rareWord, rareInst, rareViaAnnouncement
+    local dimName
+    local started = os.clock()
+    repeat
+        if mode == "dim" then
+            local _, found = scanMap(false, true)
+            dimName = found
+            if dimName then break end
+            task.wait(1.3)
+        else
+            local size, count = scanForEggs()
+            if size > biggest then biggest = size end
+            if count > checked then checked = count end
+
+            if mode == "rare" and not rareWord then
+                -- 1) el aviso del servidor: "A Secret ... egg spawned in ..."
+                if announcementRarity and announcementTime >= started - 15 then
+                    rareWord, rareViaAnnouncement = announcementRarity, true
+                end
+                -- 2) la rareza o el nombre del huevo leidos de sus datos en el mapa
+                if not rareWord then
+                    rareWord, rareInst = findRareEgg()
+                end
+            end
+            if rareWord or (mode == "big" and biggest >= GIANT_MIN) then break end
+            task.wait(0.5)
+        end
+    until os.clock() - started >= EGG_SCAN_SECONDS or not huntOn() or not alive()
+
+    -- Este servidor ya cuenta como visto: la proxima busqueda no lo repite
+    markVisited(game.JobId)
+    saveSettings()
+
+    if not huntOn() or not alive() or settings.eggMode ~= mode then
+        return -- se apago (o cambio de modo) mientras escaneaba
+    end
+
+    if mode == "dim" then
+        -- Solo la dimension: apenas la ve abierta se queda (el jefe puede morir en cualquier momento)
+        -- y si no esta abierta sigue buscando en otro servidor, sin conformarse con nada mas.
+        if dimName then
+            holdHere(("¡Aquí! Dimensión abierta (%s)"):format(dimName))
+        else
+            pacedHop()
+        end
+        return
+    end
+
+    -- Huevos grandes: ademas de los huevos del mapa mide cualquier huevo grande en todo el mapa
+    local giantSize = 0
+    if mode == "big" and biggest < GIANT_MIN then
+        giantSize = scanMap(true, false)
+    end
+
+    local isRare = rareWord ~= nil
+    local size = math.max(biggest, giantSize)
+    local isGiant = size >= GIANT_MIN
+    if isRare then
+        size = math.max(rareInst and largestDimension(rareInst) or biggest, 0.1)
+    end
+    -- Solo sirve lo que se pidio: raro en modo raros, 40+ en modo grandes. Nada de conformarse con otra cosa.
+    local qualifies = (mode == "rare" and isRare) or (mode == "big" and isGiant)
+    local rareLabel = isRare and rareWord or ""
+    local score = size + (isRare and RARE_BONUS or 0)
+
+    -- Con lugar para que el servidor no se llene (cuenta que yo ya estoy dentro)
+    local roomy = Players.MaxPlayers - #Players:GetPlayers() >= HUNT_MIN_FREE - 1
+
+    -- Si venia de vuelta hacia uno de los mejores, comprueba que llego Y que el huevo sigue ahi
+    local arrived, lost
+    if settings.eggReturning then
+        settings.eggReturning = false
+        local candidate = findCandidate(game.JobId)
+        if candidate then
+            local stillThere = qualifies
+                or (mode == "rare" and candidate.ann and os.time() - (candidate.t or 0) < RARE_LIFETIME)
+            if stillThere then
+                arrived = candidate
+            else
+                removeCandidate(game.JobId)
+                lost = true
+            end
+        else
+            -- no se pudo entrar a ninguno: empieza una busqueda nueva
+            resetHunt()
+        end
+        saveSettings()
+    end
+
+    if arrived then
+        local label = arrived.rare ~= "" and arrived.rare or (rareLabel ~= "" and rareLabel or nil)
+        holdHere(foundMessage(label, math.max(size, arrived.size or 0)))
+    elseif lost and #topList() > 0 then
+        -- el huevo ya no estaba: prueba el siguiente mejor
+        settings.eggReturning = true
+        saveSettings()
+        goToServer(topList(), "Teletransportando al siguiente mejor...")
+        task.wait(AUTO_RETRY_DELAY)
+    elseif qualifies and not roomy then
+        -- lo que busco, en un servidor casi lleno: mejor quedarme que arriesgarme a no volver
+        holdHere(foundMessage(rareLabel ~= "" and rareLabel or nil, size))
+    else
+        if qualifies then
+            addCandidate(game.JobId, score, size, rareLabel, { giant = isGiant, ann = rareViaAnnouncement })
+        end
+        settings.eggSamples = settings.eggSamples + 1
+        saveSettings()
+
+        local top = topList()
+        if settings.eggSamples >= EGG_SAMPLE_SERVERS and #top > 0 then
+            local best = top[1]
+            if best.job == game.JobId then
+                holdHere(foundMessage(best.rare ~= "" and best.rare or nil, best.size))
+            else
+                -- vuelve al mejor servidor visto; si no deja entrar, prueba el 2o y el 3o
+                settings.eggReturning = true
+                saveSettings()
+                goToServer(top, "Teletransportando al mejor servidor...")
+                task.wait(AUTO_RETRY_DELAY)
+            end
+        else
+            pacedHop()
+        end
+    end
+end
+
 task.spawn(function()
     if not game:IsLoaded() then
         game.Loaded:Wait()
@@ -1877,182 +1878,20 @@ task.spawn(function()
     task.wait(AUTO_START_DELAY)
 
     while alive() do
-        if huntOn() and not busy then
-            local mode = settings.eggMode
-            -- Recien encendido: el servidor donde estas NO cuenta; primero viaja a otros
-            local freshStart = settings.eggFresh
-            settings.eggFresh = false
-            statusSuffix = ""
-            setStatus(
-                (mode == "rare" and "Buscando huevos raros...")
-                    or (mode == "dim" and "Buscando la dimensión...")
-                    or "Buscando huevos grandes...",
-                "busy")
-
-            -- Escanea unos segundos (el mapa carga poco a poco) y se queda con lo mejor visto
-            local biggest, checked = 0, 0
-            local rareWord, rareInst
-            local dimNames = {}
-            local started = os.clock()
-            if freshStart then
-                started = started - EGG_SCAN_SECONDS -- no se detiene a escanear: una sola pasada
-            end
-            repeat
-                if mode == "dim" then
-                    local _, _, _, names = scanMap()
-                    for key, raw in pairs(names) do
-                        dimNames[key] = raw
-                    end
-                    task.wait(1)
-                else
-                    local size, count = scanForEggs()
-                    if size > biggest then biggest = size end
-                    if count > checked then checked = count end
-
-                    if mode == "rare" and not rareWord then
-                        -- 1) el aviso del servidor: "A Secret ... egg spawned in ..."
-                        if announcementRarity and announcementTime >= started - 15 then
-                            rareWord = announcementRarity
-                        end
-                        -- 2) la rareza o el nombre del huevo leidos de sus datos en el mapa
-                        if not rareWord then
-                            rareWord, rareInst = findRareEgg()
-                        end
-                    end
-                    task.wait(0.5)
-                end
-            until os.clock() - started >= EGG_SCAN_SECONDS or not huntOn() or not alive()
-
-            -- Este servidor ya cuenta como visto: la proxima busqueda no lo repite
-            markVisited(game.JobId)
-            saveSettings()
-
-            if not huntOn() or not alive() then
-                -- se apago mientras escaneaba
-            elseif freshStart then
-                -- el servidor donde estabas no cuenta: viaja de inmediato a buscar en otros
-                if mode == "dim" then
-                    judgeDimension(dimNames) -- solo aprende que objetos son permanentes
-                    saveSettings()
-                end
-                hop()
-                task.wait(AUTO_RETRY_DELAY)
-            elseif mode == "dim" then
-                -- Solo la dimension: si en este servidor esta abierta se queda (el jefe puede morir en cualquier
-                -- momento); si no, sigue con otro servidor, sin conformarse con nada mas.
-                local open, learned = judgeDimension(dimNames)
-                saveSettings()
-                if open then
-                    holdHere(("Encontrado: dimensión abierta (%s)"):format(open))
-                else
-                    if learned then
-                        statusSuffix = " | sin dimensión"
-                    else
-                        statusSuffix = (" | aprendiendo %d/%d"):format(settings.dimVisits, DIM_WARMUP)
-                    end
-                    hop()
-                    task.wait(AUTO_RETRY_DELAY)
-                end
+        -- un error del script no debe dejar el menu muerto: se avisa y sigue
+        local okStep, stepError = pcall(function()
+            if huntOn() and not busy then
+                huntStep()
+            elseif settings.auto and not busy then
+                pacedHop()
             else
-                -- Huevos grandes: busca ademas huevos de GIANT_MIN o mas en todo el mapa
-                local giantSize = 0
-                if mode == "big" then
-                    giantSize = scanMap()
-                end
-                local isGiant = giantSize >= GIANT_MIN
-
-                -- Puntaje del servidor: primero la rareza (modo raros) o el huevo enorme (modo grandes),
-                -- despues el tamano del huevo
-                local isRare = rareWord ~= nil
-                local size = math.max(biggest, giantSize)
-                if isRare then
-                    size = math.max(rareInst and largestDimension(rareInst) or biggest, 0.1)
-                end
-                local hasEggs = checked > 0 or isRare or isGiant
-                local score = size + (isRare and RARE_BONUS or 0) + (isGiant and GIANT_BONUS or 0)
-                local rareLabel = isRare and rareWord or ""
-
-                -- Solo sirve para volver si tiene espacio: un servidor casi lleno se llena y ya no deja entrar
-                local freeSlots = Players.MaxPlayers - #Players:GetPlayers()
-                local roomy = freeSlots >= HUNT_MIN_FREE
-                local eligible = hasEggs and roomy
-
-                -- Si venia de vuelta hacia uno de los mejores, comprueba que llego (puede ser el 1o, 2o o 3o)
-                local arrivedInfo
-                if settings.eggReturning then
-                    settings.eggReturning = false
-                    arrivedInfo = hasEggs and findCandidate(game.JobId) or nil
-                    if not arrivedInfo then
-                        -- no se pudo entrar a ninguno: empieza una busqueda nueva
-                        resetHunt()
-                    end
-                    saveSettings()
-                end
-
-                if hasEggs and not roomy then
-                    statusSuffix = " | casi lleno"
-                elseif isGiant then
-                    statusSuffix = (" | gigante %.1f"):format(size)
-                elseif hasEggs then
-                    statusSuffix = (isRare and " | raro %.1f" or " | huevo %.1f"):format(size)
-                else
-                    statusSuffix = " | sin huevos"
-                end
-
-                if arrivedInfo then
-                    local label = arrivedInfo.rare ~= "" and arrivedInfo.rare or rareLabel
-                    holdHere(foundMessage(mode, label ~= "" and label or nil, size, isGiant or arrivedInfo.giant))
-                elseif isRare or isGiant then
-                    -- raro (modo raros) o enorme (modo grandes): se queda de inmediato. No hay que volver
-                    -- despues (el servidor podria llenarse) y el huevo puede ser robado en cualquier momento.
-                    holdHere(foundMessage(mode, rareLabel ~= "" and rareLabel or nil, size, isGiant))
-                else
-                    if eligible then
-                        addCandidate(game.JobId, score, size, rareLabel, { giant = isGiant })
-                    end
-                    settings.eggSamples = settings.eggSamples + 1
-                    saveSettings()
-
-                    local top = topList()
-                    if settings.eggSamples >= EGG_SAMPLE_SERVERS and #top > 0 then
-                        local best = top[1]
-                        if best.job == game.JobId then
-                            holdHere(foundMessage(mode, best.rare ~= "" and best.rare or nil, best.size, best.giant))
-                        else
-                            -- antes de volver, comprueba que esos servidores no se hayan llenado
-                            setStatus("Compruebo que el mejor servidor tenga espacio...", "busy")
-                            local reachable = stillRoomy(top)
-                            if #reachable == 0 then
-                                -- todos casi llenos: mejor buscar de nuevo que caer en uno cualquiera sin huevo
-                                setStatus("Los mejores servidores se llenaron; sigo buscando", "busy")
-                                resetHunt()
-                                saveSettings()
-                                hop()
-                            else
-                                -- vuelve al mejor servidor con espacio; si no deja entrar, prueba el siguiente
-                                settings.eggReturning = true
-                                saveSettings()
-                                best = reachable[1]
-                                if best.giant then
-                                    statusSuffix = (" | gigante %.1f"):format(best.size)
-                                else
-                                    statusSuffix = ((best.rare ~= "") and " | raro %.1f" or " | huevo %.1f"):format(best.size)
-                                end
-                                goToServer(reachable, "Teletransportando al mejor servidor...")
-                            end
-                            task.wait(AUTO_RETRY_DELAY)
-                        end
-                    else
-                        hop()
-                        task.wait(AUTO_RETRY_DELAY)
-                    end
-                end
+                task.wait(0.3)
             end
-        elseif settings.auto and not busy then
-            hop()
-            task.wait(AUTO_RETRY_DELAY)
-        else
-            task.wait(0.3)
+        end)
+        if not okStep then
+            warn("[@XanScc Server] " .. tostring(stepError))
+            setStatus("Error del script: " .. tostring(stepError):sub(1, 70), "error")
+            task.wait(3)
         end
     end
 end)

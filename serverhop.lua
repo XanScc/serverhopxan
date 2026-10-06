@@ -38,6 +38,8 @@ local settings = {
     maxPlayers = 0, -- 0 = sin limite
     sort = "Random",
     auto = false,
+    knownRare = "starry fox", -- nombres de huevos raros ya vistos en avisos ("|" entre nombres)
+    rareHunt = false,         -- buscando servidores con huevos del top 4 de rarezas
 }
 
 local function saveSettings()
@@ -273,7 +275,7 @@ local function rainbow(parent)
     return g
 end
 
-local W, H = 290, 304
+local W, H = 290, 442
 
 local main = make("Frame", {
     Size = UDim2.fromOffset(W, H),
@@ -574,6 +576,69 @@ notifyRetry = function()
     setStatus("Roblox va lento, sigo buscando...", "busy")
 end
 
+---------------------------------------------------------------------
+-- Datos del servidor y huevos raros (agregado)
+---------------------------------------------------------------------
+local function buttonIn(parent, text, position, colorA, colorB)
+    local bg = make("Frame", {
+        Size = UDim2.new(0.5, -4, 1, 0),
+        Position = position,
+        BackgroundColor3 = C.white,
+        BorderSizePixel = 0,
+    }, parent)
+    corner(bg, 10)
+    gradient(bg, 0, colorA, colorB)
+    return make("TextButton", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = C.white,
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        BorderSizePixel = 0,
+    }, bg)
+end
+
+local eggSection = section(38)
+local scanBtn = buttonIn(eggSection, "Escanear servidor", UDim2.fromOffset(0, 0),
+    Color3.fromRGB(245, 158, 11), Color3.fromRGB(239, 68, 68))
+local rareBtn = buttonIn(eggSection, "Buscar raros", UDim2.new(0.5, 4, 0, 0),
+    Color3.fromRGB(236, 72, 153), C.accentA)
+
+local infoSection = section(92)
+local infoBox = make("Frame", {
+    Size = UDim2.new(1, 0, 1, 0),
+    BackgroundColor3 = C.field,
+    BorderSizePixel = 0,
+}, infoSection)
+corner(infoBox, 8)
+stroke(infoBox, C.border, 1, 0)
+
+local infoLabel = make("TextLabel", {
+    Size = UDim2.new(1, -16, 1, -8),
+    Position = UDim2.fromOffset(8, 4),
+    BackgroundTransparency = 1,
+    Text = "Pulsa «Escanear servidor» para ver el huevo más grande, su tamaño y su zona.",
+    TextColor3 = C.text,
+    Font = Enum.Font.GothamMedium,
+    TextSize = 11,
+    TextWrapped = true,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+}, infoBox)
+
+local copyBtn = make("TextButton", {
+    Size = UDim2.fromOffset(50, 18),
+    Position = UDim2.new(1, -56, 1, -22),
+    BackgroundColor3 = C.border,
+    Text = "Copiar",
+    TextColor3 = C.white,
+    Font = Enum.Font.GothamBold,
+    TextSize = 10,
+    BorderSizePixel = 0,
+}, infoBox)
+corner(copyBtn, 6)
+
 -- Credito abajo, tambien en arcoiris
 local footer = make("TextLabel", {
     Size = UDim2.new(1, 0, 1, 0),
@@ -839,6 +904,1015 @@ task.spawn(function()
         end
     end
 end)
+
+---------------------------------------------------------------------
+-- Huevos: tamano, zona y rareza (agregado)
+---------------------------------------------------------------------
+-- Cosas que se sabe del juego (Steal An Egg):
+--  * Los huevos del mapa son hijos de Workspace.AreaEggSlotsClient; el nombre del modelo no dice la rareza.
+--  * Tamano: se mide en studs (el huevo mas grande del modelo); el peso en kg solo se ve en la mochila.
+--  * Rarezas, de menor a mayor: Common, Uncommon, Rare, Epic, Legendary, Mythic, Cosmic, Secret, Eternal, Divine.
+--    El "top 4" son Cosmic, Secret, Eternal y Divine.
+--  * Zonas (Workspace.World.Areas.GuardAreas): Forest, Lake, Desert, Jungle, Snow, Volcano, Abyss Ocean,
+--    Prehistoric, Cosmic, Cherry Blossom, Titan Temple, Light Dark, Enchanted Forest.
+--  * Cuando sale un huevo raro, el juego avisa: "A Secret Starry Fox Egg spawned in Enchanted Forest!".
+local GIANT_MIN = 40.0          -- un huevo de tantos studs o mas se marca como gigante
+local RARE_POOL = 100           -- servidores que junta la busqueda de raros
+local RARE_SCAN_SECONDS = 3     -- segundos que revisa cada servidor buscando un raro
+local RARE_LIFETIME = 270       -- segundos que vale un aviso de huevo raro
+local RARE_WORDS = { "divine", "eternal", "secret", "cosmic" }
+
+-- Rarezas del top 4 que se han visto salir en cada zona (segun guias del juego; puede estar incompleto)
+local ZONE_RARES = {
+    ["forest"] = "ninguna de las 4 más buscadas",
+    ["lake"] = "Cosmic",
+    ["desert"] = "Cosmic",
+    ["jungle"] = "Secret",
+    ["snow"] = "Secret, Eternal",
+    ["volcano"] = "Secret, Eternal",
+    ["abyss ocean"] = "Eternal",
+    ["prehistoric"] = "Secret, Eternal",
+    ["cosmic"] = "Cosmic, Secret, Eternal, Divine",
+    ["cherry blossom"] = "Cosmic, Secret, Eternal, Divine",
+    ["titan temple"] = "Divine",
+    ["enchanted forest"] = "Secret (Starry Fox)",
+}
+
+-- Los 5 huevos de la zona Enchanted Forest traen su nombre en el atributo PreparedSourceName
+local ZONE_BY_EGG = {
+    ["prism gecko"] = "Enchanted Forest",
+    ["petal beetle"] = "Enchanted Forest",
+    ["enchanted bluejay"] = "Enchanted Forest",
+    ["astral jackalope"] = "Enchanted Forest",
+    ["starry fox"] = "Enchanted Forest",
+}
+
+local function notify(text)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "@XanScc Server",
+            Text = text,
+            Duration = 10,
+        })
+    end)
+end
+
+local function cleanText(text)
+    return (text:gsub("<[^>]*>", "")) -- quita etiquetas de texto enriquecido
+end
+
+local function capital(text)
+    return text:sub(1, 1):upper() .. text:sub(2)
+end
+
+local function largestDimension(inst)
+    local ok, size = pcall(function()
+        return inst:IsA("Model") and inst:GetExtentsSize() or inst.Size
+    end)
+    if ok and size then
+        return math.max(size.X, size.Y, size.Z)
+    end
+    return 0
+end
+
+-- Nombre del tipo de huevo ("Starry Fox") si el modelo lo trae; si no, nil.
+local function eggTypeName(inst)
+    local source = inst:GetAttribute("PreparedSourceName")
+    if type(source) == "string" then
+        return source:match("NewEggs%.(.+)$")
+    end
+    return nil
+end
+
+local function rareWordIn(text)
+    local lower = tostring(text):lower()
+    for _, word in ipairs(RARE_WORDS) do
+        if lower:find(word, 1, true) then
+            return word
+        end
+    end
+    return nil
+end
+
+-- Busca una rareza en el nombre, atributos, valores y textos de un objeto y de todo lo que tiene dentro.
+local function treeRarity(root)
+    local function check(obj)
+        local word = rareWordIn(obj.Name)
+        if word then return word end
+        for _, value in pairs(obj:GetAttributes()) do
+            if type(value) == "string" then
+                word = rareWordIn(value)
+                if word then return word end
+            end
+        end
+        if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+            word = rareWordIn(obj.Text)
+            if word then return word end
+        elseif obj:IsA("StringValue") then
+            word = rareWordIn(obj.Value)
+            if word then return word end
+        end
+        return nil
+    end
+
+    local word = check(root)
+    if word then return word end
+    for _, d in ipairs(root:GetDescendants()) do
+        word = check(d)
+        if word then return word end
+    end
+    return nil
+end
+
+-- Nombres de huevos raros ya vistos en avisos del juego (guardados entre saltos)
+local function isKnownRare(typeName)
+    local lower = typeName:lower()
+    for name in tostring(settings.knownRare):gmatch("[^|]+") do
+        if name == lower then
+            return true
+        end
+    end
+    return false
+end
+
+local function learnRare(typeName)
+    if typeName == "" or isKnownRare(typeName) then return end
+    settings.knownRare = settings.knownRare .. "|" .. typeName:lower()
+    saveSettings()
+end
+
+-- Rareza de UN huevo (top 4): por su nombre de tipo ya conocido, o por lo escrito en sus datos / plantilla.
+-- Devuelve la rareza ("secret"), "raro" si solo se sabe que es raro, o nil.
+local function eggRarity(egg)
+    -- el juego marca los huevos raros con un resaltado propio (RareAreaEggHighlight) dentro del modelo
+    if egg:FindFirstChild("RareAreaEggHighlight", true) then
+        return "raro"
+    end
+    local typeName = eggTypeName(egg)
+    if typeName and isKnownRare(typeName) then
+        return "raro"
+    end
+    local word = treeRarity(egg)
+    if word then return word end
+
+    local templateName = typeName
+    local newEggs = workspace:FindFirstChild("NewEggs")
+    local template = templateName and newEggs and newEggs:FindFirstChild(templateName)
+    if template then
+        return treeRarity(template)
+    end
+    return nil
+end
+
+-- Todos los huevos del mapa: { { inst, size }, ... }
+local function listEggs()
+    local eggs = {}
+    local slots = workspace:FindFirstChild("AreaEggSlotsClient")
+    if slots then
+        for _, child in ipairs(slots:GetChildren()) do
+            if child:IsA("Model") or child:IsA("BasePart") then
+                eggs[#eggs + 1] = { inst = child, size = largestDimension(child) }
+            end
+        end
+    end
+    return eggs
+end
+
+-- Primer huevo raro (top 4) del mapa, o nil. Devuelve (rareza, huevo).
+local function findRareEgg()
+    for _, egg in ipairs(listEggs()) do
+        local word = eggRarity(egg.inst)
+        if word then
+            return word, egg.inst
+        end
+    end
+    return nil
+end
+
+-- Zonas del mapa: cada hijo de Workspace.World.Areas (y, dentro de GuardAreas, cada zona), con su caja.
+-- Antes solo se miraba GuardAreas y zonas como "Demons" no salian.
+local zoneCache = { time = -100, list = {} }
+
+local function boundsOf(area)
+    local ok, center, size = pcall(function()
+        if area:IsA("Model") then
+            local cf, sz = area:GetBoundingBox()
+            return cf.Position, sz
+        elseif area:IsA("BasePart") then
+            return area.Position, area.Size
+        end
+        local lo, hi, count
+        for _, d in ipairs(area:GetDescendants()) do
+            if d:IsA("BasePart") then
+                local p, half = d.Position, d.Size / 2
+                local a, b = p - half, p + half
+                if not lo then
+                    lo, hi = a, b
+                else
+                    lo = Vector3.new(math.min(lo.X, a.X), math.min(lo.Y, a.Y), math.min(lo.Z, a.Z))
+                    hi = Vector3.new(math.max(hi.X, b.X), math.max(hi.Y, b.Y), math.max(hi.Z, b.Z))
+                end
+                count = (count or 0) + 1
+                if count >= 300 then break end
+            end
+        end
+        if lo then
+            return (lo + hi) / 2, hi - lo
+        end
+    end)
+    if ok and center then
+        return center, size
+    end
+    return nil
+end
+
+local function zoneList()
+    if os.clock() - zoneCache.time < 10 and #zoneCache.list > 0 then
+        return zoneCache.list
+    end
+    local list = {}
+    pcall(function()
+        for _, area in ipairs(workspace.World.Areas:GetChildren()) do
+            local items = (area.Name == "GuardAreas") and area:GetChildren() or { area }
+            for _, item in ipairs(items) do
+                local center, size = boundsOf(item)
+                if center then
+                    list[#list + 1] = { name = item.Name, center = center, size = size }
+                end
+            end
+        end
+    end)
+    zoneCache = { time = os.clock(), list = list }
+    return list
+end
+
+-- Zona (bioma) de un huevo: si su nombre la trae ("..._Forest:Slot_005") o es de la zona nueva, esa;
+-- si no, la zona cuya caja contiene al huevo (la mas chica) y, si ninguna, la mas cercana (aproximada).
+local function zoneOfEgg(inst)
+    if not inst then return nil end
+
+    local typeName = eggTypeName(inst)
+    if typeName and ZONE_BY_EGG[typeName:lower()] then
+        return ZONE_BY_EGG[typeName:lower()]
+    end
+
+    local fromName = inst.Name:match("_([^_:]+):Slot_%d+$")
+    if fromName then
+        return fromName
+    end
+
+    local ok, zone = pcall(function()
+        local position = inst:IsA("Model") and inst:GetPivot().Position or inst.Position
+        local inside, insideArea, nearest, nearestDistance
+        for _, z in ipairs(zoneList()) do
+            local d = position - z.center
+            local area = z.size.X * z.size.Z
+            if math.abs(d.X) <= z.size.X / 2 and math.abs(d.Z) <= z.size.Z / 2 then
+                if not insideArea or area < insideArea then
+                    inside, insideArea = z.name, area
+                end
+            end
+            local distance = Vector3.new(d.X, 0, d.Z).Magnitude
+            if not nearestDistance or distance < nearestDistance then
+                nearest, nearestDistance = z.name, distance
+            end
+        end
+        if inside then
+            return inside
+        end
+        return nearest and (nearest .. " (aprox.)") or nil
+    end)
+    if ok and zone then
+        return zone
+    end
+    return nil
+end
+
+local function zoneRares(zone)
+    if not zone then return nil end
+    local key = zone:gsub(" %(aprox%.%)", ""):lower()
+    return ZONE_RARES[key]
+end
+
+---------------------------------------------------------------------
+-- Avisos del juego: "A Secret Starry Fox Egg spawned in Enchanted Forest!"
+---------------------------------------------------------------------
+-- Cartel grande arriba de la pantalla: SOLO sale al pulsar "Escanear servidor" y hay huevos raros
+-- (una linea por huevo). Se quita solo a los 10 segundos.
+local banner, bannerToken = nil, 0
+local function hideBanner()
+    bannerToken = bannerToken + 1
+    if banner then
+        banner.Visible = false
+    end
+end
+
+local function showBanner(text, lines)
+    task.spawn(function()
+        pcall(function()
+            if not banner then
+                banner = make("TextLabel", {
+                    BackgroundColor3 = Color3.fromRGB(120, 20, 160),
+                    TextColor3 = C.white,
+                    Font = Enum.Font.GothamBold,
+                    TextSize = 14,
+                    TextWrapped = true,
+                    Visible = false,
+                    ZIndex = 10,
+                }, gui)
+                corner(banner, 10)
+                stroke(banner, Color3.fromRGB(251, 191, 36), 2, 0)
+            end
+            banner.Size = UDim2.fromOffset(460, 16 + 18 * (lines or 1))
+            banner.Position = UDim2.new(0.5, -230, 0, 70)
+            banner.Text = text
+            banner.Visible = true
+            bannerToken = bannerToken + 1
+            local token = bannerToken
+            task.wait(10)
+            if bannerToken == token then
+                banner.Visible = false
+            end
+        end)
+    end)
+end
+
+-- Ultimos avisos del juego de huevos Divine / Eternal / Secret / Cosmic: sirven para ponerle nombre y zona
+-- a los huevos raros cuando se escanea el servidor.
+local recentAnnouncements = {}
+
+local announcement       -- ultimo aviso visto en este servidor, resumido ("Secret Starry Fox")
+local announcementRarity -- su rareza si es del top 4 ("secret"), si no nil
+local announcementZone   -- zona que dice el aviso ("Enchanted Forest")
+local announcementTime = 0
+
+local function parseAnnouncement(text)
+    local clean = cleanText(text)
+    local at = clean:lower():find("spawned in", 1, true)
+    if not at then return nil end
+
+    local egg = (clean:sub(1, at - 1):gsub("^%s*[Aa]n?%s+", ""))
+    egg = (egg:gsub("%s+[Hh]as%s*$", ""))
+    egg = (egg:gsub("%s+[Ee]gg%s*$", ""))
+    egg = egg:match("^%s*(.-)%s*$")
+    if egg == "" then return nil end
+
+    local zone = clean:sub(at + #"spawned in"):match("^%s*([%a%s']+)")
+    zone = zone and zone:match("^(.-)%s*$") or nil
+    return egg, zone
+end
+
+local function checkAnnouncement(text)
+    -- los avisos son frases largas: ignora rapido los textos cortos o enormes (contadores, dinero, etc.)
+    if type(text) ~= "string" or #text < 20 or #text > 300 then return end
+    local lower = text:lower()
+    if lower:find("egg", 1, true) and lower:find("spawned", 1, true) then
+        local egg, zone = parseAnnouncement(text)
+        if not egg then return end
+        announcement = egg
+        announcementZone = zone
+        announcementTime = os.clock()
+
+        -- la rareza es la primera palabra ("Secret Starry Fox"): solo cuenta si es del top 4
+        announcementRarity = rareWordIn(egg:match("^(%S+)") or "")
+
+        -- "Secret Starry Fox" -> aprende "starry fox" para reconocer ese huevo en el mapa
+        local typeName = egg:match("^%S+%s+(.+)$")
+        if typeName and announcementRarity then
+            learnRare(typeName)
+        end
+        if announcementRarity then
+            local last = recentAnnouncements[#recentAnnouncements]
+            if not (last and last.name == egg and os.clock() - last.time < 60) then
+                recentAnnouncements[#recentAnnouncements + 1] = { name = egg, zone = zone, time = os.clock(), type = typeName }
+                while #recentAnnouncements > 10 do
+                    table.remove(recentAnnouncements, 1)
+                end
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    pcall(function()
+        game:GetService("TextChatService").MessageReceived:Connect(function(message)
+            checkAnnouncement(message.Text)
+        end)
+    end)
+
+    local playerGui = player:FindFirstChildOfClass("PlayerGui") or player:WaitForChild("PlayerGui", 10)
+    if not playerGui then return end
+
+    local function watch(label)
+        checkAnnouncement(label.Text)
+        label:GetPropertyChangedSignal("Text"):Connect(function()
+            checkAnnouncement(label.Text)
+        end)
+    end
+    for _, d in ipairs(playerGui:GetDescendants()) do
+        if d:IsA("TextLabel") then
+            watch(d)
+        end
+    end
+    playerGui.DescendantAdded:Connect(function(d)
+        if d:IsA("TextLabel") then
+            watch(d)
+        end
+    end)
+end)
+
+---------------------------------------------------------------------
+-- Panel de datos del servidor
+---------------------------------------------------------------------
+local info = {}
+local function renderInfo()
+    local lines = {}
+    lines[1] = "Huevo: " .. (info.egg or "-") .. "  |  " .. (info.rarity or "-")
+    if info.size then
+        lines[2] = ("Tamaño: %.1f studs%s"):format(info.size, info.size >= GIANT_MIN and " (gigante)" or "")
+    else
+        lines[2] = "Tamaño: -"
+    end
+    lines[3] = "Zona: " .. (info.zone or "-")
+    local rares = zoneRares(info.zone)
+    if rares then
+        lines[3] = lines[3] .. "  (ahí salen: " .. rares .. ")"
+    end
+    lines[4] = ("Servidor: %d/%d jugadores"):format(#Players:GetPlayers(), Players.MaxPlayers)
+        .. (info.count and (" | huevos: " .. info.count .. " | raros: " .. (info.rareCount or 0)) or "")
+    lines[5] = info.note or ""
+    infoLabel.Text = table.concat(lines, "\n")
+end
+
+local function setInfo(fields)
+    for k, v in pairs(fields) do
+        if v == false then
+            info[k] = nil
+        else
+            info[k] = v
+        end
+    end
+    renderInfo()
+end
+
+---------------------------------------------------------------------
+-- Guia al huevo: lo resalta y muestra la distancia, para que vayas caminando
+---------------------------------------------------------------------
+local guides = {} -- { { inst, text, highlight, billboard, label }, ... }
+
+local function clearGuide()
+    for _, g in ipairs(guides) do
+        pcall(function() if g.highlight then g.highlight:Destroy() end end)
+        pcall(function() if g.billboard then g.billboard:Destroy() end end)
+    end
+    guides = {}
+end
+
+local function eggPosition(inst)
+    local ok, pos = pcall(function()
+        return inst:IsA("Model") and inst:GetPivot().Position or inst.Position
+    end)
+    return ok and pos or nil
+end
+
+local function distanceTo(inst)
+    local ok, d = pcall(function()
+        local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        local pos = eggPosition(inst)
+        if root and pos then
+            return math.floor((root.Position - pos).Magnitude)
+        end
+    end)
+    return (ok and type(d) == "number") and d or nil
+end
+
+local function addGuide(inst, text, color)
+    local part = inst:IsA("BasePart") and inst
+        or (inst:IsA("Model") and (inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true)))
+    if not part then return end
+
+    local g = { inst = inst, text = text }
+    pcall(function()
+        g.highlight = make("Highlight", {
+            Adornee = inst,
+            FillColor = color or Color3.fromRGB(251, 191, 36),
+            FillTransparency = 0.5,
+            OutlineColor = C.white,
+            DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+        }, gui)
+        g.billboard = make("BillboardGui", {
+            Adornee = part,
+            AlwaysOnTop = true,
+            Size = UDim2.fromOffset(150, 32),
+            StudsOffset = Vector3.new(0, 4, 0),
+        }, gui)
+        g.label = make("TextLabel", {
+            Size = UDim2.new(1, 0, 1, 0),
+            BackgroundColor3 = C.bg,
+            BackgroundTransparency = 0.3,
+            TextColor3 = C.white,
+            Font = Enum.Font.GothamBold,
+            TextSize = 10,
+            TextWrapped = true,
+            Text = text,
+        }, g.billboard)
+        corner(g.label, 8)
+    end)
+    guides[#guides + 1] = g
+end
+
+local function setGuide(inst, text, color)
+    clearGuide()
+    addGuide(inst, text, color)
+end
+
+-- Actualiza la distancia a cada huevo guiado (y quita la guia si el huevo desaparece o se cierra el menu)
+task.spawn(function()
+    while alive() do
+        for i = #guides, 1, -1 do
+            local g = guides[i]
+            if not g.inst.Parent then
+                pcall(function() if g.highlight then g.highlight:Destroy() end end)
+                pcall(function() if g.billboard then g.billboard:Destroy() end end)
+                table.remove(guides, i)
+            elseif g.label then
+                local d = distanceTo(g.inst)
+                if d then
+                    pcall(function()
+                        local name, detail = g.text:match("^(.-)\n(.*)$")
+                        name = name or g.text
+                        if d <= 150 then
+                            g.billboard.Size = UDim2.fromOffset(210, detail and 54 or 38)
+                            g.label.TextSize = 11
+                            g.label.BackgroundTransparency = 0.3
+                            g.label.Text = name .. (detail and ("\n" .. detail) or "") .. "\n" .. d .. " studs"
+                        elseif d <= 500 then
+                            g.billboard.Size = UDim2.fromOffset(150, 32)
+                            g.label.TextSize = 10
+                            g.label.BackgroundTransparency = 0.45
+                            g.label.Text = name .. "\n" .. d .. " studs"
+                        else
+                            g.billboard.Size = UDim2.fromOffset(120, 20)
+                            g.label.TextSize = 9
+                            g.label.BackgroundTransparency = 0.6
+                            g.label.Text = name:sub(1, 22) .. " | " .. d
+                        end
+                    end)
+                end
+            end
+        end
+        task.wait(0.3)
+    end
+    clearGuide()
+end)
+
+---------------------------------------------------------------------
+-- Escanear servidor: recopila los datos del servidor y marca el huevo mas grande
+---------------------------------------------------------------------
+-- Descripcion corta de un objeto (atributos e hijos) para el reporte
+local function describeShort(inst)
+    local parts = { inst:GetFullName() }
+    local attrs = {}
+    for key, value in pairs(inst:GetAttributes()) do
+        attrs[#attrs + 1] = key .. "=" .. tostring(value)
+    end
+    if #attrs > 0 then parts[#parts + 1] = "atributos{" .. table.concat(attrs, ", ") .. "}" end
+    local kids = {}
+    for _, child in ipairs(inst:GetChildren()) do
+        kids[#kids + 1] = child.Name
+        if #kids >= 8 then break end
+    end
+    if #kids > 0 then parts[#parts + 1] = "hijos(" .. table.concat(kids, ", ") .. ")" end
+
+    -- lo de adentro (Hitbox, etc.): textos, valores, cuadros de interaccion y atributos de las partes
+    local extras = {}
+    for _, d in ipairs(inst:GetDescendants()) do
+        if d:IsA("TextLabel") or d:IsA("TextButton") then
+            if d.Text ~= "" then extras[#extras + 1] = "texto:" .. cleanText(d.Text) end
+        elseif d:IsA("ValueBase") then
+            extras[#extras + 1] = d.Name .. "=" .. tostring(d.Value)
+        elseif d:IsA("ProximityPrompt") then
+            extras[#extras + 1] = "prompt:" .. d.ObjectText .. "/" .. d.ActionText
+        end
+        local childAttrs = {}
+        for key, value in pairs(d:GetAttributes()) do
+            childAttrs[#childAttrs + 1] = key .. "=" .. tostring(value)
+        end
+        if #childAttrs > 0 then extras[#extras + 1] = d.Name .. "{" .. table.concat(childAttrs, ", ") .. "}" end
+        if #extras >= 14 then break end
+    end
+    if #extras > 0 then parts[#parts + 1] = "dentro{" .. table.concat(extras, " | ") .. "}" end
+    return table.concat(parts, " ; ")
+end
+
+local function zoneKey(z)
+    if not z then return nil end
+    return ((z:gsub(" %(aprox%.%)", "")):lower())
+end
+
+-- Busca el aviso del juego que corresponde a un huevo raro: primero por el nombre del tipo, luego por la zona.
+-- "used" evita darle el mismo aviso a dos huevos.
+local function matchAnnouncement(inst, zone, used)
+    local typeName = eggTypeName(inst)
+    for i = #recentAnnouncements, 1, -1 do
+        local a = recentAnnouncements[i]
+        if not used[a] and typeName and a.type and a.type:lower() == typeName:lower() then
+            used[a] = true
+            return a
+        end
+    end
+    for i = #recentAnnouncements, 1, -1 do
+        local a = recentAnnouncements[i]
+        if not used[a] and a.zone and zoneKey(a.zone) == zoneKey(zone) then
+            used[a] = true
+            return a
+        end
+    end
+    return nil
+end
+
+-- Texto de rareza para el panel
+local function rarityText(word)
+    if not word then return "no raro / sin detectar" end
+    if word == "raro" then
+        if announcementRarity and (os.clock() - announcementTime) < RARE_LIFETIME then
+            return capital(announcementRarity) .. " (confirmado por aviso)"
+        end
+        return "RARO (aura del juego; rareza sin confirmar)"
+    end
+    return capital(word)
+end
+
+-- Describe la marca de rareza de un huevo (para el reporte): tamano, zona, nombre y colores del resaltado
+local function describeMark(egg)
+    local mark = egg:FindFirstChild("RareAreaEggHighlight", true)
+    if not mark then return nil end
+    local parts = { ("%.1f"):format(largestDimension(egg)), zoneOfEgg(egg) or "-", egg.Name, mark.ClassName }
+    pcall(function()
+        parts[#parts + 1] = "FillColor=" .. tostring(mark.FillColor) .. " OutlineColor=" .. tostring(mark.OutlineColor)
+            .. " Enabled=" .. tostring(mark.Enabled)
+    end)
+    for key, value in pairs(mark:GetAttributes()) do
+        parts[#parts + 1] = key .. "=" .. tostring(value)
+    end
+    -- particulas del aura (Glow, glare...): colores y cantidad
+    local count = 0
+    for _, d in ipairs(egg:GetDescendants()) do
+        if d:IsA("ParticleEmitter") then
+            count = count + 1
+            if count <= 6 then
+                pcall(function()
+                    local keys = d.Color.Keypoints
+                    parts[#parts + 1] = ("particula %s color(%s -> %s) rate=%s enabled=%s"):format(
+                        d.Name, tostring(keys[1].Value), tostring(keys[#keys].Value), tostring(d.Rate), tostring(d.Enabled))
+                end)
+            end
+        end
+    end
+    return table.concat(parts, " | ")
+end
+
+local lastReport = ""
+
+local function scanServer()
+    setStatus("Escaneando servidor...", "busy")
+    local eggs = listEggs()
+    table.sort(eggs, function(a, b) return a.size > b.size end)
+
+    local rareCount, firstRare, rareEggs = 0, nil, {}
+    local lines = {
+        ("Servidor %s | jugadores %d/%d | huevos %d"):format(game.JobId, #Players:GetPlayers(), Players.MaxPlayers, #eggs),
+    }
+    for i, egg in ipairs(eggs) do
+        local rarity = eggRarity(egg.inst)
+        if rarity then
+            rareCount = rareCount + 1
+            rareEggs[#rareEggs + 1] = egg
+            if not firstRare then firstRare = egg end
+        end
+        if i <= 60 then
+            lines[#lines + 1] = ("%.1f | tipo %s | zona %s | rareza %s | %s"):format(
+                egg.size, eggTypeName(egg.inst) or "-", zoneOfEgg(egg.inst) or "-", rarity or "-", egg.inst.Name)
+        end
+    end
+
+    for _, egg in ipairs(eggs) do
+        local mark = describeMark(egg.inst)
+        if mark then
+            lines[#lines + 1] = "MARCADO RARO: " .. mark
+            lines[#lines + 1] = "detalle raro: " .. describeShort(egg.inst)
+        end
+    end
+
+    -- aviso reciente del juego (huevo raro)
+    local recent = announcement and (os.clock() - announcementTime) < RARE_LIFETIME
+    if announcement then
+        lines[#lines + 1] = "aviso: " .. announcement .. " | zona " .. tostring(announcementZone)
+    end
+    for i = 1, math.min(3, #eggs) do
+        lines[#lines + 1] = "detalle " .. i .. ": " .. describeShort(eggs[i].inst)
+    end
+    local shown = {}
+    for _, egg in ipairs(eggs) do
+        local typeName = eggTypeName(egg.inst)
+        if typeName and not shown[typeName] then
+            shown[typeName] = true
+            lines[#lines + 1] = "tipo " .. typeName .. ": " .. describeShort(egg.inst)
+        end
+    end
+    local newEggs = workspace:FindFirstChild("NewEggs")
+    if newEggs then
+        lines[#lines + 1] = "== Workspace.NewEggs (plantillas) =="
+        for i, template in ipairs(newEggs:GetChildren()) do
+            if i > 40 then break end
+            lines[#lines + 1] = describeShort(template)
+        end
+    end
+    local areas = workspace:FindFirstChild("World") and workspace.World:FindFirstChild("Areas")
+    if areas then
+        lines[#lines + 1] = "== Workspace.World.Areas (todas las areas) =="
+        for i, area in ipairs(areas:GetChildren()) do
+            if i > 30 then break end
+            local kids = {}
+            for _, child in ipairs(area:GetChildren()) do
+                kids[#kids + 1] = child.Name
+                if #kids >= 14 then break end
+            end
+            lines[#lines + 1] = ("area %s [%s] hijos(%s)"):format(area.Name, area.ClassName, table.concat(kids, ", "))
+        end
+    end
+    local zoneBoxes = {}
+    for _, z in ipairs(zoneList()) do
+        zoneBoxes[#zoneBoxes + 1] = ("%s centro(%d,%d) tam(%d x %d)"):format(z.name, z.center.X, z.center.Z, z.size.X, z.size.Z)
+    end
+    lines[#lines + 1] = "== cajas de zonas usadas =="
+    for _, box in ipairs(zoneBoxes) do lines[#lines + 1] = box end
+
+    local demons, seenCount = {}, 0
+    for _, d in ipairs(workspace:GetDescendants()) do
+        seenCount = seenCount + 1
+        if seenCount % 4000 == 0 then task.wait() end
+        if d.Name:lower():find("demon", 1, true) then
+            demons[#demons + 1] = d:GetFullName() .. " [" .. d.ClassName .. "]"
+            if #demons >= 10 then break end
+        end
+    end
+    if #demons > 0 then
+        lines[#lines + 1] = "== objetos con 'demon' =="
+        for _, d in ipairs(demons) do lines[#lines + 1] = d end
+    end
+
+    local guard = workspace:FindFirstChild("World") and workspace.World:FindFirstChild("Areas")
+    guard = guard and guard:FindFirstChild("GuardAreas")
+    if guard then
+        local names = {}
+        for _, zone in ipairs(guard:GetChildren()) do names[#names + 1] = zone.Name end
+        lines[#lines + 1] = "zonas: " .. table.concat(names, ", ")
+    end
+    lastReport = table.concat(lines, "\n")
+
+    local biggest = eggs[1]
+    if not biggest then
+        clearGuide()
+        hideBanner()
+        setInfo({ egg = false, rarity = false, size = false, zone = false, count = 0, rareCount = 0,
+            note = recent and ("Aviso: " .. announcement) or "No hay huevos en el mapa de este servidor (todavía)." })
+        setStatus("Escaneo listo: sin huevos", "info")
+        return
+    end
+
+    local inst = biggest.inst
+    local typeName = eggTypeName(inst)
+    local rarity = eggRarity(inst)
+    local zone = zoneOfEgg(inst)
+    setInfo({
+        egg = typeName or "huevo del mapa",
+        rarity = rarityText(rarity),
+        size = biggest.size,
+        zone = zone or false,
+        count = #eggs,
+        rareCount = rareCount,
+        note = (#rareEggs > 0 and ("Raros: %d (ver cartel y guías en el mapa)"):format(#rareEggs))
+            or (recent and ("Aviso: " .. announcement .. (announcementZone and (" en " .. announcementZone) or "")) or "Resaltado en el mapa: camina hacia el huevo"),
+    })
+    -- guias en el mapa: una por cada huevo raro (rosa) y el mas grande (amarillo), cada una con su distancia
+    clearGuide()
+    local used, bannerLines, biggestIsRare = {}, {}, false
+    for i, egg in ipairs(rareEggs) do
+        if egg.inst == inst then biggestIsRare = true end
+        if i > 6 then
+            bannerLines[#bannerLines + 1] = ("... y %d raros más"):format(#rareEggs - 6)
+            break
+        end
+        local zone = zoneOfEgg(egg.inst)
+        local ann = matchAnnouncement(egg.inst, zone, used)
+        local name = (ann and ann.name) or (eggTypeName(egg.inst) and ("Raro " .. eggTypeName(egg.inst))) or "RARO (aura)"
+        local where = (ann and ann.zone) or zone or "?"
+        local d = distanceTo(egg.inst)
+        bannerLines[#bannerLines + 1] = ("%s  |  %.1f studs  |  %s%s"):format(
+            name, egg.size, where, d and ("  |  a " .. d .. " studs") or "")
+        addGuide(egg.inst, ("%s\n%.1f studs | %s"):format(name, egg.size, where), Color3.fromRGB(236, 72, 153))
+    end
+    if not biggestIsRare then
+        addGuide(inst, ("Huevo más grande: %.1f"):format(biggest.size))
+    end
+    if #bannerLines > 0 then
+        showBanner(table.concat(bannerLines, "\n"), #bannerLines)
+    else
+        hideBanner()
+    end
+    setStatus(("Escaneo listo: más grande %.1f"):format(biggest.size), "ok")
+end
+
+scanBtn.Activated:Connect(function()
+    local ok, err = pcall(scanServer)
+    if not ok then
+        warn("[@XanScc Server] " .. tostring(err))
+        setStatus("No pude escanear este servidor", "info")
+    end
+end)
+
+copyBtn.Activated:Connect(function()
+    if lastReport == "" then
+        setStatus("Primero pulsa Escanear servidor", "info")
+        return
+    end
+    local copied = false
+    if setclipboard then
+        copied = pcall(setclipboard, lastReport)
+    end
+    if copied then
+        setStatus("Datos copiados al portapapeles", "ok")
+    else
+        warn(lastReport)
+        setStatus("Datos en la consola (F9)", "info")
+    end
+end)
+
+---------------------------------------------------------------------
+-- Buscar raros: salta de servidor en servidor hasta uno con un huevo del top 4 (de cualquier tamano)
+---------------------------------------------------------------------
+-- La lista de servidores se guarda unos minutos para no pedirla a Roblox en cada salto
+-- (Roblox bloquea si se piden muchas paginas seguidas).
+local function rareListFromCache()
+    local c = env.__SH_RPOOL
+    local list = {}
+    if type(c) == "table" and c.place == placeId and type(c.list) == "table" and os.time() - (c.time or 0) <= 600 then
+        for _, server in ipairs(c.list) do
+            if normalAccept(server) then
+                list[#list + 1] = server
+            end
+        end
+    end
+    return list
+end
+
+local function huntHop()
+    if busy then return false end
+    busy = true
+
+    local list = rareListFromCache()
+    if #list == 0 then
+        setStatus("Buscando servidores...", "busy")
+        local ok, found, failed = pcall(collectServers, normalAccept, { "Asc", "Desc" }, RARE_POOL, false, nil)
+        if not ok or #found == 0 then
+            setStatus(failed and "Roblox va lento, reintento..." or "No hay servidores con ese filtro", "info")
+            busy = false
+            return false
+        end
+        shuffle(found)
+        env.__SH_RPOOL = { place = placeId, time = os.time(), list = found }
+        list = found
+    end
+
+    -- toma los primeros y los saca de la lista (ya no se repiten)
+    pool = {}
+    local used = {}
+    for i = 1, math.min(#list, MAX_TELEPORT_TRIES) do
+        pool[i] = list[i]
+        used[list[i].id] = true
+    end
+    local c = env.__SH_RPOOL
+    if type(c) == "table" and type(c.list) == "table" then
+        local keep = {}
+        for _, server in ipairs(c.list) do
+            if not used[server.id] then keep[#keep + 1] = server end
+        end
+        c.list = keep
+    end
+    poolIndex = 1
+    triesUsed = 0
+    if not teleportNext() then
+        setStatus("Teleport falló, reintenta", "info")
+        busy = false
+        return false
+    end
+    return true
+end
+
+local function refreshRareButton()
+    rareBtn.Text = settings.rareHunt and "Parar raros" or "Buscar raros"
+end
+refreshRareButton()
+
+local skipFirst = false -- el servidor donde estas al encender la busqueda no cuenta: se busca en OTROS
+
+rareBtn.Activated:Connect(function()
+    settings.rareHunt = not settings.rareHunt
+    if settings.rareHunt then
+        -- el modo automatico y la busqueda de raros no pueden saltar los dos a la vez
+        if settings.auto then
+            settings.auto = false
+            refreshSwitch(true)
+        end
+        skipFirst = true
+        setStatus("Buscando huevos raros (Divine, Eternal, Secret, Cosmic)...", "ok")
+    else
+        setStatus("Búsqueda de raros apagada", "info")
+    end
+    refreshRareButton()
+    saveSettings()
+end)
+
+-- Revisa el servidor donde acaba de entrar: aviso del juego o huevo raro del mapa
+local function scanForRare()
+    local started = os.clock()
+    repeat
+        if announcementRarity and announcementTime >= started - 15 then
+            return announcementRarity, nil
+        end
+        local word, inst = findRareEgg()
+        if word then
+            return word, inst
+        end
+        task.wait(0.5)
+    until os.clock() - started >= RARE_SCAN_SECONDS or not settings.rareHunt or not alive()
+    return nil
+end
+
+local function foundRare(word, inst)
+    settings.rareHunt = false
+    saveSettings()
+    refreshRareButton()
+
+    local label = (word == "raro") and "raro" or capital(word)
+    local size = inst and largestDimension(inst) or nil
+    local fresh = announcementZone and (os.clock() - announcementTime) < RARE_LIFETIME
+    local zone = (fresh and announcementZone) or (inst and zoneOfEgg(inst)) or announcementZone
+    setInfo({
+        egg = (inst and eggTypeName(inst)) or announcement or "huevo raro",
+        rarity = rarityText(word),
+        size = size or false,
+        zone = zone or false,
+        count = false,
+        rareCount = false,
+        note = "¡Encontrado! Me quedo en este servidor",
+    })
+    if inst then
+        setGuide(inst, "Huevo raro: " .. label)
+    end
+    local message = "¡Aquí! Huevo " .. label .. (size and (" de " .. ("%.1f"):format(size) .. " studs") or "")
+        .. (zone and (" en " .. zone) or "")
+    setStatus(message, "ok")
+    notify(message)
+end
+
+task.spawn(function()
+    if not game:IsLoaded() then
+        game.Loaded:Wait()
+    end
+    task.wait(AUTO_START_DELAY)
+
+    while alive() do
+        local okStep, stepError = pcall(function()
+            if settings.rareHunt and not busy then
+                if skipFirst then
+                    skipFirst = false
+                    huntHop()
+                    task.wait(AUTO_RETRY_DELAY)
+                    return
+                end
+                setStatus("Buscando huevos raros...", "busy")
+                local word, inst = scanForRare()
+                if not settings.rareHunt or not alive() then return end
+                if word then
+                    foundRare(word, inst)
+                else
+                    huntHop()
+                    task.wait(AUTO_RETRY_DELAY)
+                end
+            else
+                task.wait(0.3)
+            end
+        end)
+        if not okStep then
+            warn("[@XanScc Server] " .. tostring(stepError))
+            task.wait(3)
+        end
+    end
+end)
+
+renderInfo()
 ]==]
 
 local env = (getgenv and getgenv()) or _G
